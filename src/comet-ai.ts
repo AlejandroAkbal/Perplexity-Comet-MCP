@@ -355,13 +355,16 @@ export class CometAI {
    * Get current agent status and progress (for polling)
    */
   async getAgentStatus(): Promise<{
-    status: "idle" | "working" | "completed";
+    status: "idle" | "working" | "completed" | "blocked";
     steps: string[];
     currentStep: string;
     response: string;
     hasStopButton: boolean;
     agentBrowsingUrl: string;
     isStable: boolean;
+    blockedReason?: "login_required";
+    blockedMessage?: string;
+    browserAutomationAvailable: boolean;
   }> {
     // Get browsing URL from agent's tab
     let agentBrowsingUrl = '';
@@ -432,6 +435,24 @@ export class CometAI {
         const hasReviewedSources = /Reviewed \\d+ sources?/i.test(body);
         const hasSourcesIndicator = /\\d+\\s*sources?/i.test(body); // "10 sources" etc
         const hasAskFollowUp = body.includes('Ask a follow-up') || body.includes('Ask follow-up');
+        const hasLoggedOutBrowserText = body.includes("Comet Assistant can't use the browser when logged out");
+        const hasUnlockCapabilitiesText = body.includes('Log in to unlock full capabilities');
+        const hasSignInAccountText = body.includes('Sign in or create an account');
+        const hasVisibleLoginDialog = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog')].some(el => {
+          if (!(el instanceof HTMLElement) || el.offsetParent === null) return false;
+          const text = (el.textContent || '').toLowerCase();
+          return text.includes('sign in') ||
+            text.includes('log in') ||
+            text.includes('create an account') ||
+            text.includes('continue with google') ||
+            text.includes('continue with apple');
+        });
+        const browserAutomationBlocked = hasLoggedOutBrowserText ||
+          ((hasUnlockCapabilitiesText || hasSignInAccountText) && hasVisibleLoginDialog);
+        const blockedReason = browserAutomationBlocked ? 'login_required' : undefined;
+        const blockedMessage = browserAutomationBlocked
+          ? 'Comet browser automation is unavailable because the browser is logged out. Sign in to unlock full capabilities.'
+          : undefined;
 
         // Check for prose content (actual response) - lowered threshold for short answers
         const proseEls = [...document.querySelectorAll('[class*="prose"]')];
@@ -458,7 +479,9 @@ export class CometAI {
 
         let status = 'idle';
 
-        if (hasActiveStopButton) {
+        if (browserAutomationBlocked) {
+          status = 'blocked';
+        } else if (hasActiveStopButton) {
           status = 'working';
         } else if (hasAskFollowUp && hasProseContent) {
           status = 'completed';
@@ -560,24 +583,30 @@ export class CometAI {
           steps: [...new Set(steps)].slice(-5),
           currentStep: steps.length > 0 ? steps[steps.length - 1] : '',
           response: response.substring(0, 8000),
-          hasStopButton: hasActiveStopButton
+          hasStopButton: hasActiveStopButton,
+          blockedReason,
+          blockedMessage,
+          browserAutomationAvailable: !browserAutomationBlocked
         };
       })()
     `);
 
     const statusResult = result.result.value as {
-      status: "idle" | "working" | "completed";
+      status: "idle" | "working" | "completed" | "blocked";
       steps: string[];
       currentStep: string;
       response: string;
       hasStopButton: boolean;
+      blockedReason?: "login_required";
+      blockedMessage?: string;
+      browserAutomationAvailable: boolean;
     };
 
     // Check response stability
     const isStable = this.isResponseStable(statusResult.response);
 
     // If response is stable and has content, override status to completed
-    if (isStable && statusResult.response.trim().length > 0 && !statusResult.hasStopButton) {
+    if (statusResult.status !== 'blocked' && isStable && statusResult.response.trim().length > 0 && !statusResult.hasStopButton) {
       statusResult.status = 'completed';
     }
 
