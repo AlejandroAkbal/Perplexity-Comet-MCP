@@ -532,7 +532,12 @@ wsl --shutdown
 
 ## Testing
 
-A full test battery covering all 8 tools across 9 groups (35 tests) is maintained in [`docs/testing.md`](docs/testing.md).
+A full test battery covering all 8 tools across 9 groups (35 tests) lives in [`tests/`](tests/). Run with:
+
+```bash
+pnpm test              # full battery (requires Perplexity Pro)
+pnpm test:no-pro       # connection, screenshot, tabs, mode — no Pro needed
+```
 
 ---
 
