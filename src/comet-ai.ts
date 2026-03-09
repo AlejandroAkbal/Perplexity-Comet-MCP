@@ -5,7 +5,8 @@ import { cometClient } from "./cdp-client.js";
 
 // Input selectors - contenteditable div is primary for Perplexity
 const INPUT_SELECTORS = [
-  '[contenteditable="true"]',
+  '[role="textbox"]',
+  '[contenteditable]',
   'textarea[placeholder*="Ask"]',
   'textarea[placeholder*="Search"]',
   'textarea',
@@ -13,26 +14,48 @@ const INPUT_SELECTORS = [
 ];
 
 export class CometAI {
-  /**
-   * Find the first matching element from a list of selectors
-   */
   private async findInputElement(): Promise<string | null> {
-    for (const selector of INPUT_SELECTORS) {
-      const result = await cometClient.evaluate(`
-        document.querySelector(${JSON.stringify(selector)}) !== null
-      `);
-      if (result.result.value === true) {
+    const result = await cometClient.evaluate(`
+      (() => {
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        if (candidates.length === 0) return null;
+        const el = candidates[0];
+        if (el.matches('[contenteditable], [role="textbox"]')) return '[contenteditable]';
+        if (el.matches('textarea')) return 'textarea';
+        return 'input[type="text"]';
+      })()
+    `);
+
+    return (result.result.value as string | null) ?? null;
+  }
+
+  private async waitForInputElement(timeoutMs = 10000, intervalMs = 400): Promise<string | null> {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      const selector = await this.findInputElement();
+      if (selector) {
         return selector;
       }
+
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
     }
+
     return null;
   }
 
-  /**
-   * Send a prompt to Comet's AI (Perplexity)
-   */
   async sendPrompt(prompt: string): Promise<string> {
-    const inputSelector = await this.findInputElement();
+    const inputSelector = await this.waitForInputElement();
 
     if (!inputSelector) {
       throw new Error("Could not find input element. Navigate to Perplexity first.");
@@ -41,21 +64,35 @@ export class CometAI {
     // Use execCommand for contenteditable elements (works with React/Vue)
     const result = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]');
-        if (el) {
-          el.focus();
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const el = candidates[0];
+        if (!el) return { success: false };
+
+        el.focus();
+
+        if (el.matches('[contenteditable], [role="textbox"]')) {
           document.execCommand('selectAll', false, null);
           document.execCommand('insertText', false, ${JSON.stringify(prompt)});
           return { success: true };
         }
-        // Fallback for textarea
-        const textarea = document.querySelector('textarea');
-        if (textarea) {
-          textarea.focus();
-          textarea.value = ${JSON.stringify(prompt)};
-          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+        if ('value' in el) {
+          el.value = ${JSON.stringify(prompt)};
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
           return { success: true };
         }
+
         return { success: false };
       })()
     `);
@@ -71,9 +108,6 @@ export class CometAI {
     return `Prompt sent: "${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}"`;
   }
 
-  /**
-   * Submit the current prompt
-   */
   private async submitPrompt(): Promise<void> {
     // Wait for React to process the typed content
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -81,11 +115,21 @@ export class CometAI {
     // Verify text was typed before attempting submit
     const hasContent = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]');
-        if (el && el.innerText.trim().length > 0) return true;
-        const textarea = document.querySelector('textarea');
-        if (textarea && textarea.value.trim().length > 0) return true;
-        return false;
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const el = candidates[0];
+        if (!el) return false;
+        if (el.matches('[contenteditable], [role="textbox"]')) return el.innerText.trim().length > 0;
+        return 'value' in el && el.value.trim().length > 0;
       })()
     `);
 
@@ -96,8 +140,18 @@ export class CometAI {
     // Strategy 1: Simulate Enter key via DOM events (most reliable for contenteditable)
     const enterResult = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]') ||
-                   document.querySelector('textarea');
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const el = candidates[0];
         if (!el) return { success: false, reason: 'no input element' };
 
         el.focus();
@@ -133,9 +187,20 @@ export class CometAI {
     // Check if submission worked
     const submitted = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]');
-        // If input is empty or nearly empty, submission worked
-        if (el && el.innerText.trim().length < 5) return true;
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const el = candidates[0];
+        if (el && el.matches('[contenteditable], [role="textbox"]') && el.innerText.trim().length < 5) return true;
+        if (el && 'value' in el && el.value.trim().length < 5) return true;
         // Check for loading indicators
         const hasLoading = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"]') !== null;
         const hasThinking = document.body.innerText.includes('Thinking');
@@ -165,8 +230,18 @@ export class CometAI {
         }
 
         // Find the submit button by position (usually rightmost button near input)
-        const inputEl = document.querySelector('[contenteditable="true"]') ||
-                        document.querySelector('textarea');
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const inputEl = candidates[0];
         if (inputEl) {
           const inputRect = inputEl.getBoundingClientRect();
           let parent = inputEl.parentElement;
@@ -214,8 +289,20 @@ export class CometAI {
     // Final verification and last resort
     const finalCheck = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]');
-        if (el && el.innerText.trim().length < 5) return true;
+        const candidates = [...document.querySelectorAll('textarea, input[type="text"], [role="textbox"], [contenteditable]')]
+          .filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 &&
+              rect.height > 0 &&
+              style.display !== 'none' &&
+              style.visibility !== 'hidden';
+          })
+          .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
+        const el = candidates[0];
+        if (el && el.matches('[contenteditable], [role="textbox"]') && el.innerText.trim().length < 5) return true;
+        if (el && 'value' in el && el.value.trim().length < 5) return true;
         const hasLoading = document.querySelector('[class*="animate"]') !== null;
         const hasThinking = document.body.innerText.includes('Thinking');
         return hasLoading || hasThinking;
@@ -244,7 +331,7 @@ export class CometAI {
    * Check if response has stabilized (same content for multiple polls)
    */
   isResponseStable(currentResponse: string): boolean {
-    if (currentResponse && currentResponse.length > 50) {
+    if (currentResponse && currentResponse.trim().length > 0) {
       if (currentResponse === this.lastResponseText) {
         this.stableResponseCount++;
       } else {
@@ -291,30 +378,51 @@ export class CometAI {
       (() => {
         const body = document.body.innerText;
 
-        // Check for active stop button (more comprehensive check)
         let hasActiveStopButton = false;
         for (const btn of document.querySelectorAll('button')) {
-          const rect = btn.querySelector('rect');
-          const svg = btn.querySelector('svg');
           const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
           const btnText = btn.innerText.toLowerCase();
 
-          // Stop button indicators: square icon (rect), "stop" label, or specific SVG patterns
-          const isStopButton = rect ||
-                              ariaLabel.includes('stop') ||
-                              ariaLabel.includes('cancel') ||
-                              btnText === 'stop';
+          if (btn.offsetParent === null || btn.disabled) continue;
 
-          if (isStopButton && btn.offsetParent !== null && !btn.disabled) {
+          const isDismissButton = ariaLabel.includes('close') ||
+                                  ariaLabel.includes('dismiss') ||
+                                  ariaLabel.includes('sign') ||
+                                  ariaLabel.includes('login') ||
+                                  ariaLabel.includes('modal');
+
+          if (isDismissButton) continue;
+
+          const rectEl = btn.querySelector('rect');
+          const isSquareRect = rectEl &&
+            Math.abs(parseFloat(rectEl.getAttribute('width') || '0') -
+                     parseFloat(rectEl.getAttribute('height') || '0')) < 4;
+
+          const isStopButton = (ariaLabel.includes('stop') ||
+                                ariaLabel.includes('cancel') ||
+                                btnText === 'stop' ||
+                                isSquareRect) &&
+                               !isDismissButton;
+
+          if (isStopButton) {
             hasActiveStopButton = true;
             break;
           }
         }
 
-        // More comprehensive loading detection
-        const hasLoadingSpinner = document.querySelector(
-          '[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="thinking"]'
-        ) !== null;
+        const hasLoadingSpinner = (() => {
+          const spinners = document.querySelectorAll(
+            '[class*="animate-spin"],[class*="animate-pulse"],[class*="loading"],[class*="thinking"]'
+          );
+          for (const el of spinners) {
+            if (el.closest('nav,aside,header,[role="dialog"],[role="banner"],[aria-modal]')) continue;
+            if (el.closest('[class*="sidebar"],[class*="modal"],[class*="overlay"],[class*="dialog"]')) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            return true;
+          }
+          return false;
+        })();
 
         // Check for "Thinking" indicator specifically
         const hasThinkingIndicator = body.includes('Thinking') && !body.includes('Thinking about');
@@ -329,8 +437,12 @@ export class CometAI {
         const proseEls = [...document.querySelectorAll('[class*="prose"]')];
         const hasProseContent = proseEls.some(el => {
           const text = el.innerText.trim();
-          // Must have some content, not just UI text (lowered from 50 to 15 for short answers)
-          return text.length > 15 && !text.startsWith('Library') && !text.startsWith('Discover');
+          return text.length > 0 &&
+            !text.startsWith('Library') &&
+            !text.startsWith('Discover') &&
+            !text.startsWith('Spaces') &&
+            !text.startsWith('Finance') &&
+            !text.startsWith('Search');
         });
 
         // Check if input is focused (user might be typing, not agent working)
@@ -344,28 +456,21 @@ export class CometAI {
         ];
         const hasWorkingText = workingPatterns.some(p => body.includes(p));
 
-        // Determine status with improved logic
         let status = 'idle';
 
-        // FIRST: Check if actively working (stop button is the strongest indicator)
         if (hasActiveStopButton) {
           status = 'working';
-        } else if (hasLoadingSpinner || hasThinkingIndicator) {
-          status = 'working';
-        }
-        // SECOND: Check completion indicators BEFORE working text
-        // (because completed pages still show historical step text)
-        else if (hasStepsCompleted || hasFinishedMarker) {
-          status = 'completed';
         } else if (hasAskFollowUp && hasProseContent) {
           status = 'completed';
+        } else if (hasStepsCompleted || hasFinishedMarker) {
+          status = 'completed';
+        } else if (hasLoadingSpinner || hasThinkingIndicator) {
+          status = 'working';
         } else if (hasSourcesIndicator && hasProseContent && !hasActiveStopButton) {
           status = 'completed';
         } else if (hasReviewedSources && !hasActiveStopButton) {
           status = 'completed';
-        }
-        // THIRD: Fall back to working text patterns (only if no completion signals)
-        else if (hasWorkingText) {
+        } else if (hasWorkingText) {
           status = 'working';
         }
 
@@ -380,40 +485,29 @@ export class CometAI {
           if (matches) steps.push(...matches.map(s => s.trim().substring(0, 100)));
         }
 
-        // Extract response - get the FULL FINAL response after agent completes
         let response = '';
-        if (status === 'completed') {
+        {
           const mainContent = document.querySelector('main') || document.body;
           const bodyText = mainContent.innerText;
 
-          // Strategy 1: Find content after "X steps completed" marker (agent's final response)
-          const stepsMatch = bodyText.match(/(\\d+)\\s*steps?\\s*completed/i);
+          const stepsMatch = bodyText.match(/(\d+)\s*steps?\s*completed/i);
           if (stepsMatch) {
             const markerIndex = bodyText.indexOf(stepsMatch[0]);
             if (markerIndex !== -1) {
-              // Get everything after the marker
               let afterMarker = bodyText.substring(markerIndex + stepsMatch[0].length).trim();
-
-              // Remove the ">" or arrow that often follows
-              afterMarker = afterMarker.replace(/^[>›→\\s]+/, '').trim();
-
-              // Find where the response ends (before input area or UI elements)
+              afterMarker = afterMarker.replace(/^[>›→\s]+/, '').trim();
               const endMarkers = ['Ask anything', 'Ask a follow-up', 'Add details', 'Type a message'];
               let endIndex = afterMarker.length;
               for (const marker of endMarkers) {
                 const idx = afterMarker.indexOf(marker);
-                if (idx !== -1 && idx < endIndex) {
-                  endIndex = idx;
-                }
+                if (idx !== -1 && idx < endIndex) endIndex = idx;
               }
-
               response = afterMarker.substring(0, endIndex).trim();
             }
           }
 
-          // Strategy 2: If no steps marker, look for content after source citations
-          if (!response || response.length < 50) {
-            const sourcesMatch = bodyText.match(/Reviewed\\s+\\d+\\s+sources?/i);
+          if (!response || response.length < 1) {
+            const sourcesMatch = bodyText.match(/Reviewed\s+\d+\s+sources?/i);
             if (sourcesMatch) {
               const markerIndex = bodyText.indexOf(sourcesMatch[0]);
               if (markerIndex !== -1) {
@@ -429,8 +523,7 @@ export class CometAI {
             }
           }
 
-          // Strategy 3: Fallback - get all prose content combined
-          if (!response || response.length < 50) {
+          if (!response || response.length < 1) {
             const allProseEls = [...mainContent.querySelectorAll('[class*="prose"]')];
             const validTexts = allProseEls
               .filter(el => {
@@ -438,31 +531,28 @@ export class CometAI {
                 const text = el.innerText.trim();
                 const isUIText = ['Library', 'Discover', 'Spaces', 'Finance', 'Account',
                                   'Upgrade', 'Home', 'Search'].some(ui => text.startsWith(ui));
-                return !isUIText && text.length > 30;
+                return !isUIText && text.length > 0;
               })
               .map(el => el.innerText.trim());
 
-            // Combine all valid prose texts, taking the last/most recent ones
             if (validTexts.length > 0) {
-              // Take last 3 prose blocks max (most recent response)
               response = validTexts.slice(-3).join('\\n\\n');
             }
           }
+        }
 
-          // Clean up response - preserve formatting but remove UI artifacts
-          if (response) {
-            response = response
-              .replace(/View All/gi, '')
-              .replace(/Show more/gi, '')
-              .replace(/Ask a follow-up/gi, '')
-              .replace(/Ask anything\\.*/gi, '')
-              .replace(/Add details to this task\\.*/gi, '')
-              .replace(/\\d+\\s*sources?\\s*$/gi, '')
-              .replace(/[\\u{1F300}-\\u{1F9FF}]/gu, '') // Remove most emojis from UI
-              .replace(/^[>›→\\s]+/gm, '') // Remove leading arrows
-              .replace(/\\n{3,}/g, '\\n\\n') // Collapse multiple newlines
-              .trim();
-          }
+        if (response) {
+          response = response
+            .replace(/View All/gi, '')
+            .replace(/Show more/gi, '')
+            .replace(/Ask a follow-up/gi, '')
+            .replace(/Ask anything\\.*/gi, '')
+            .replace(/Add details to this task\\.*/gi, '')
+            .replace(/\\d+\\s*sources?\\s*$/gi, '')
+            .replace(/[\\u{1F300}-\\u{1F9FF}]/gu, '')
+            .replace(/^[>›→\\s]+/gm, '')
+            .replace(/\\n{3,}/g, '\\n\\n')
+            .trim();
         }
 
         return {
@@ -487,7 +577,7 @@ export class CometAI {
     const isStable = this.isResponseStable(statusResult.response);
 
     // If response is stable and has content, override status to completed
-    if (isStable && statusResult.response.length > 50 && !statusResult.hasStopButton) {
+    if (isStable && statusResult.response.trim().length > 0 && !statusResult.hasStopButton) {
       statusResult.status = 'completed';
     }
 
